@@ -9,6 +9,8 @@ import os
 import warnings
 import numpy as np
 import datetime
+import glob as glob
+import mne
 
 
 HEADER_LENGTH = 16 * 1024  # 16 kilobytes of header
@@ -54,48 +56,51 @@ def read_header(fid):
     # Read the raw header data (16 kb) from the file object fid. Restores the position in the file object after reading.
     pos = fid.tell()
     fid.seek(0)
-    raw_hdr = fid.read(HEADER_LENGTH).strip(b'\0')
+    raw_header = fid.read(HEADER_LENGTH).strip(b'\0')
     fid.seek(pos)
 
-    return raw_hdr
+    return raw_header
 
 
-def parse_header(raw_hdr):
+def parse_header(raw_header):
     # Parse the header string into a dictionary of name value pairs
-    hdr = dict()
+    header = dict()
 
     # Decode the header as iso-8859-1 (the spec says ASCII, but there is at least one case of 0xB5 in some headers)
-    raw_hdr = raw_hdr.decode('iso-8859-1')
+    raw_header = raw_header.decode('iso-8859-1')
 
     # Neuralynx headers seem to start with a line identifying the file, so
     # let's check for it
-    hdr_lines = [line.strip() for line in raw_hdr.split('\r\n') if line != '']
-    if hdr_lines[0] != '######## Neuralynx Data File Header':
-        warnings.warn('Unexpected start to header: ' + hdr_lines[0])
+    header_lines = [line.strip() for line in raw_header.split('\r\n') if line != '']
+    if header_lines[0] != '######## Neuralynx Data File Header':
+        warnings.warn('Unexpected start to header: ' + header_lines[0])
 
     # Try to read the original file path
     try:
-        assert hdr_lines[1].split()[1:3] == ['File', 'Name']
-        hdr[u'FileName']  = ' '.join(hdr_lines[1].split()[3:])
-        # hdr['save_path'] = hdr['FileName']
+        for line in header_lines:
+            if 'OriginalFileName' in line:
+                header[u'FileName']  = line.split('\"')[1]
+            if 'TimeClosed' in line:
+                header[u'TimeClosed'] = line
+                header[u'TimeClosed_dt'] = parse_neuralynx_time_string(line)
+            if 'TimeOpened' in line:
+                header[u'TimeOpened'] = line
+                header[u'TimeOpened_dt'] = parse_neuralynx_time_string(line)
     except:
-        warnings.warn('Unable to parse original file path from Neuralynx header: ' + hdr_lines[1])
+        warnings.warn('Unable to parse info from Neuralynx header')
 
     # Process lines with file opening and closing times
-    hdr[u'TimeOpened'] = hdr_lines[2][3:]
-    hdr[u'TimeOpened_dt'] = parse_neuralynx_time_string(hdr_lines[2])
-    hdr[u'TimeClosed'] = hdr_lines[3][3:]
-    hdr[u'TimeClosed_dt'] = parse_neuralynx_time_string(hdr_lines[3])
+
 
     # Read the parameters, assuming "-PARAM_NAME PARAM_VALUE" format
-    for line in hdr_lines[4:]:
+    for line in header_lines[4:]:
         try:
-            name, value = line[1:].split()  # Ignore the dash and split PARAM_NAME and PARAM_VALUE
-            hdr[name] = value
+            name, value = line[1:].split(' ', 1)  # Ignore the dash and split PARAM_NAME and PARAM_VALUE
+            header[name] = value
         except:
             warnings.warn('Unable to parse parameter line from Neuralynx header: ' + line)
 
-    return hdr
+    return header
 
 
 def read_records(fid, record_dtype, record_skip=0, count=None):
@@ -127,36 +132,34 @@ def estimate_record_count(file_path, record_dtype):
 def parse_neuralynx_time_string(time_string):
     # Parse a datetime object from the idiosyncratic time string in Neuralynx file headers
     try:
-        tmp_date = [int(x) for x in time_string.split()[4].split('/')]
-        tmp_time = [int(x) for x in time_string.split()[-1].replace('.', ':').split(':')]
-        tmp_microsecond = tmp_time[3] * 1000
+        date = [int(x) for x in time_string.split()[1].split('/')]
+        time = [int(x) for x in time_string.split()[-1].replace('.', ':').split(':')]
     except:
         warnings.warn('Unable to parse time string from Neuralynx header: ' + time_string)
         return None
     else:
-        return datetime.datetime(tmp_date[2], tmp_date[0], tmp_date[1],  # Year, month, day
-                                 tmp_time[0], tmp_time[1], tmp_time[2],  # Hour, minute, second
-                                 tmp_microsecond)
-
+        return datetime.datetime(date[0], date[1], date[2],
+                                 time[0], time[1], time[2])
 
 def check_ncs_records(records):
     # Check that all the records in the array are "similar" (have the same sampling frequency etc.
-    dt = np.diff(records['TimeStamp'])
+    dt = np.rint(np.diff(records['TimeStamp']))
     dt = np.abs(dt - dt[0])
+    is_valid = True
     if not np.all(records['ChannelNumber'] == records[0]['ChannelNumber']):
         warnings.warn('Channel number changed during record sequence')
-        return False
+        is_valid = False
     elif not np.all(records['SampleFreq'] == records[0]['SampleFreq']):
         warnings.warn('Sampling frequency changed during record sequence')
-        return False
-    elif not np.all(records['NumValidSamples'] == 512):
+        is_valid = False
+    elif np.any(records['NumValidSamples'] != 512):
         warnings.warn('Invalid samples in one or more records')
-        return False
+        is_valid = False
     elif not np.all(dt <= 1):
         warnings.warn('Time stamp difference tolerance exceeded')
-        return False
+        is_valid = False
     else:
-        return True
+        return is_valid
 
 
 def load_ncs(file_path, load_time=True, rescale_data=True, signal_scaling=MICROVOLT_SCALING):
@@ -187,8 +190,8 @@ def load_ncs(file_path, load_time=True, rescale_data=True, signal_scaling=MICROV
     ncs['header'] = header
     ncs['data'] = data
     ncs['data_units'] = signal_scaling[1] if rescale_data else 'ADC counts'
-    ncs['sampling_rate'] = records['SampleFreq'][0]
-    ncs['channel_number'] = records['ChannelNumber'][0]
+    ncs['sampling_freq'] = records['SampleFreq'][0]
+    ncs['channel'] = records['ChannelNumber'][0]
     ncs['timestamp'] = records['TimeStamp']
 
     # Calculate the sample time points (if needed)
@@ -248,16 +251,58 @@ if __name__ == "__main__":
 # Load triggers
     os.chdir('/mnt/cifs/rdss/rdss_kahwang/ECoG_data/525-040_Flanker/2020-08-19_16-01-34')
 
+    trig1 = load_ncs('Inpt1.ncs')
     trig2 = load_ncs('Inpt2.ncs')
     trig3 = load_ncs('Inpt3.ncs')
-    trig4 = load_ncs('Inpt4.ncs')
 
     # example plotting
-    sns.lineplot(data=trig3['data'][1005000:1300000])
-    sns.lineplot(data=trig4['data'][1005000:1300000])
-
+    # sns.lineplot(data=trig1['data'][0:])
+    # sns.lineplot(data=trig2['data'][0:])
+    # sns.lineplot(data=trig3['data'][0:])
+    # plt.show()
     # load LFP
-    lfp = load_ncs('LFPx65.ncs')
-    sns.lineplot(data=lfp['data'][1005000:1300000])
+    # sns.lineplot(data=lfp['data'][1250000:1300000])
+    # plt.show()
+    print(trig2['data'])
+    arr1 = np.where(trig1['data'] > 1000)[0]
+    arr2 = np.where(trig2['data'] > 1000)[0]
+    arr3 = np.where(trig3['data'] > 1000)[0]
+    
+    is_consecutive = True
+    epochs = []
+    current_epoch = []
+    for index in np.arange(arr2.size):
+        if index != 0 and abs(arr2[index] - arr2[index - 1]) > 50:
+            epochs.append(current_epoch)
+            current_epoch = []
+        if index == arr2.size - 1:
+            current_epoch.append(arr2[index])
+            epochs.append(current_epoch)
+        current_epoch.append(arr2[index])
+        
+        lfp_list = glob.glob('LFP*.ncs')
+    for index in range(len(lfp_list)):
+        lfp_list[index] = load_ncs(lfp_list[index])
+    lfp_list.sort(key=lambda x: x['channel'])
+    channels = [str(file['channel']) for file in lfp_list]
+
+    sampling_freq = lfp_list[0]['sampling_freq']
+    length = lfp_list[0]['time'][-1] - lfp_list[0]['time'][0]
+    freq = length / len(lfp_list[0]['time'])
+    if any(file['sampling_freq'] != sampling_freq for file in lfp_list):
+        warnings.warn('Sample frequency does not match for all LFP files.')
+            
+    info = mne.create_info(channels, sfreq=sampling_freq)
+    raw_data = [lfp['data'] for lfp in lfp_list]
+
+    events = np.column_stack((np.arange(0, length, sampling_freq),
+                        np.zeros(200, dtype=int),
+                        np.array([1, 2, 1, 2, 1])))
+    event_dict = dict(congruent=1, incongruent=2)
+    simulated_epochs = mne.EpochsArray(raw_data, info, tmin=-0.5, events=events,
+                                    event_id=event_dict)
+    simulated_epochs.plot(picks='misc', show_scrollbars=False, events=events,
+                        event_id=event_dict)
 
     plt.show()
+    
