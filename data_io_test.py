@@ -1,4 +1,4 @@
-# script to test how to read neuralyx data
+co  # script to test how to read neuralyx data
 # modififed from code kindly provided by
 # alafuzof (https://github.com/alafuzof)
 # https://github.com/alafuzof/NeuralynxIO
