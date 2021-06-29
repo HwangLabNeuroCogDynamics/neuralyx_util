@@ -117,3 +117,5 @@ for file in glob.glob(LFP_dir + "Subject???-LFP.mat"):
     channels.set_annotations(annot_from_events)
     channels.plot(start=0, duration=5)
     plt.show()
+
+    ### todo remove manual rejections
